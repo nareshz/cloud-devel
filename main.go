@@ -22,6 +22,7 @@ import (
 	// "golang.org/x/time/rate"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+	"google.golang.org/grpc/metadata"
 )
 
 // Player is a struct that represents a player in a game.
@@ -40,9 +41,9 @@ func newResource() (*resource.Resource, error) {
 		))
 }
 
-func performCreateOperation(ctx context.Context, client *spanner.Client, tracer trace.Tracer, playerId int64, players ...*Player) error {
+func performCreateOperation(ctx context.Context, client *spanner.Client, tracer trace.Tracer, playerId int64, tracePrefix string, players ...*Player) error {
 	// Create a new trace for each create request.
-	ctx, span := tracer.Start(ctx, "us-longrunningapp:create-player-go")
+	ctx, span := tracer.Start(ctx, tracePrefix+"-longrunningapp:create-player-go")
 	defer span.End()
 
 	if span.SpanContext().IsSampled() {
@@ -62,9 +63,9 @@ func performCreateOperation(ctx context.Context, client *spanner.Client, tracer 
 	return err
 }
 
-func performReadOperation(ctx context.Context, client *spanner.Client, tracer trace.Tracer, playerId int64, playerEmail string) error {
+func performReadOperation(ctx context.Context, client *spanner.Client, tracer trace.Tracer, playerId int64, playerEmail string, tracePrefix string) error {
 	// Create a new trace for each read request.
-	ctx, span := tracer.Start(ctx, "us-longrunningapp:read-player-go")
+	ctx, span := tracer.Start(ctx, tracePrefix+"-longrunningapp:read-player-go")
 	defer span.End()
 
 	if span.SpanContext().IsSampled() {
@@ -88,9 +89,9 @@ func performReadOperation(ctx context.Context, client *spanner.Client, tracer tr
 	return nil
 }
 
-func performQueryOperation(ctx context.Context, client *spanner.Client, tracer trace.Tracer, playerId int64, playerEmail string) error {
+func performQueryOperation(ctx context.Context, client *spanner.Client, tracer trace.Tracer, playerId int64, playerEmail string, tracePrefix string) error {
 	// Create a new trace for each read request.
-	ctx, span := tracer.Start(ctx, "us-longrunningapp:query-player-go")
+	ctx, span := tracer.Start(ctx, tracePrefix+"-longrunningapp:query-player-go")
 	defer span.End()
 
 	if span.SpanContext().IsSampled() {
@@ -122,20 +123,20 @@ func performQueryOperation(ctx context.Context, client *spanner.Client, tracer t
 	return nil
 }
 
-func performPlayerTableOperations(ctx context.Context, client *spanner.Client, tracer trace.Tracer) {
+func performPlayerTableOperations(ctx context.Context, client *spanner.Client, tracer trace.Tracer, tracePrefix string) {
 	playerId := rand.Int63()
 	playerEmail := fmt.Sprintf("random-%d-%d@google.com", playerId, time.Now().Unix())
 	players := []*Player{
 		{FirstName: "Random", LastName: "Player", Email: playerEmail, UUID: "f1578551-eb4b-4ecd-aee2-9f97c37e164e"},
 	}
 	// Perform Write, Read and Query operation.
-	if err := performCreateOperation(ctx, client, tracer, playerId, players...); err != nil {
+	if err := performCreateOperation(ctx, client, tracer, playerId, tracePrefix, players...); err != nil {
 		log.Printf("Creating newPlayers err: %v", err)
 	}
-	if err := performReadOperation(ctx, client, tracer, playerId, playerEmail); err != nil {
+	if err := performReadOperation(ctx, client, tracer, playerId, playerEmail, tracePrefix); err != nil {
 		log.Printf("Reading newPlayers err: %v", err)
 	}
-	if err := performQueryOperation(ctx, client, tracer, playerId, playerEmail); err != nil {
+	if err := performQueryOperation(ctx, client, tracer, playerId, playerEmail, tracePrefix); err != nil {
 		log.Printf("Querying newPlayers err: %v", err)
 	}
 }
@@ -147,15 +148,16 @@ func main() {
 	const rateLimit = time.Second / 100 // 100 calls per second
 	throttle := time.Tick(rateLimit)
 
-	projectId := "span-cloud-testing"
-	instanceId := "nareshz-condor-test"
-	databaseId := "test-db"
+	projectId := os.Getenv("PROJECT_ID")
+	instanceId := os.Getenv("INSTANCE_ID")
+	databaseId := os.Getenv("DATABASE_ID")
 
 	// Set environment variable GOOGLE_API_GO_EXPERIMENTAL_TELEMETRY_PLATFORM_TRACING to "opentelemetry"
 	os.Setenv("GOOGLE_API_GO_EXPERIMENTAL_TELEMETRY_PLATFORM_TRACING", "opentelemetry")
 
+	cloudTraceEndpoint := os.Getenv("CLOUD_TRACE_ENDPOINT")
 	traceClientOptions := []option.ClientOption{
-		option.WithEndpoint("staging-cloudtrace.sandbox.googleapis.com:443"),
+		option.WithEndpoint(cloudTraceEndpoint),
 		option.WithQuotaProject(projectId),
 	}
 	// Setup trace exporter
@@ -187,8 +189,9 @@ func main() {
 		metric.WithReader(metric.NewPeriodicReader(metricExporter)),
 	)
 
+	cloudSpannerEndpoint := os.Getenv("CLOUD_SPANNER_ENDPOINT")
 	clientOptions := []option.ClientOption{
-		option.WithEndpoint("staging-wrenchworks.sandbox.googleapis.com:443"),
+		option.WithEndpoint(cloudSpannerEndpoint),
 		option.WithQuotaProject(projectId),
 	}
 
@@ -198,11 +201,14 @@ func main() {
 		SessionPoolConfig: spanner.DefaultSessionPoolConfig,
 		// Set meter provider locally
 		OpenTelemetryMeterProvider: mp,
-		EnableServerSideTracing:    true,
 	}, clientOptions...)
 	defer client.Close()
 
+	md := metadata.Pairs("x-goog-spanner-end-to-end-tracing", "true")
+	ctx = metadata.NewOutgoingContext(ctx, md)
+
 	tracer := otel.Tracer("longrunningapp.com/player-ops-tracer")
+	tracePrefix := os.Getenv("TRACE_PREFIX")
 	// Create players with 100QPS.
 	// limiter := rate.NewLimiter(100, 1)
 	for {
@@ -212,6 +218,6 @@ func main() {
 		// 	break // or handle the error appropriately
 		// }
 		<-throttle
-		go performPlayerTableOperations(ctx, client, tracer)
+		go performPlayerTableOperations(ctx, client, tracer, tracePrefix)
 	}
 }
